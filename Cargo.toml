@@ -1,0 +1,12 @@
+[package]
+name = "gsw"
+version = "0.1.0"
+edition = "2024"
+description = "Tiny Linux process and container resource monitor for Go servers"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/orvixapp/gsw"
+keywords = ["monitoring", "linux", "docker", "sqlite", "go"]
+categories = ["command-line-utilities"]
+
+[dependencies]
