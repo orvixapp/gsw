@@ -1,6 +1,6 @@
 [package]
 name = "gsw"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Tiny Linux process and container resource monitor for Go servers"
 license = "MIT"
