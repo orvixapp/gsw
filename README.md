@@ -1,48 +1,40 @@
 # gsw
 
-Monitor local y ligero para ver cuanto CPU y RAM consume un servidor Go en
-Linux.
+`gsw` is a small Linux CLI for watching the CPU, memory, disk counters, load,
+and uptime around one process or Docker container.
 
-No abre puertos, no sirve HTTP y no queda escuchando en la red. Lee `/proc`,
-guarda muestras en SQLite y muestra una vista simple en terminal con proceso vs
-sistema.
+It is designed for small servers where a full monitoring stack is too much. It
+does not open ports, serve HTTP, or expose a web UI. Metrics are read from
+`/proc`, shown in the terminal, and stored in a local SQLite database.
 
-`gsw` is open source and intentionally host-level: it is built for small Linux
-servers where a full monitoring stack would be too much.
+## Features
 
-## Compilar
+- Live terminal view for one process.
+- Docker container tracking by stable container name.
+- Automatic re-attach when a container is recreated.
+- SQLite history with retention limits.
+- Hourly summary for peak usage analysis.
+- No background daemon, no web server, no network listener.
 
-```bash
-cargo build --release
-```
+## Requirements
 
-Binario:
+- Linux.
+- SQLite runtime library.
+- Docker CLI only when using `--container`.
 
-```bash
-/home/cesar/go-server-watch/target/release/gsw
-```
-
-## Instalar comando corto
-
-```bash
-cargo install --path /home/cesar/go-server-watch
-```
-
-Despues puedes usar:
+Install SQLite runtime:
 
 ```bash
-gsw --help
-```
-
-## Instalar desde release
-
-En CachyOS/Arch:
-
-```bash
+# Arch / CachyOS
 sudo pacman -S sqlite
+
+# Ubuntu / Debian
+sudo apt install libsqlite3-0
 ```
 
-Descarga el `.tar.gz` de GitHub Releases y luego:
+## Install From Release
+
+Download the Linux archive from GitHub Releases, then:
 
 ```bash
 tar -xzf gsw-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
@@ -51,159 +43,141 @@ sudo install -m 0755 gsw /usr/local/bin/gsw
 gsw --help
 ```
 
-En Ubuntu/Debian/AWS:
+## Build From Source
 
 ```bash
-sudo apt install libsqlite3-0
-sudo install -m 0755 gsw /usr/local/bin/gsw
+cargo build --release
+sudo install -m 0755 target/release/gsw /usr/local/bin/gsw
 ```
 
-## Publicar release
-
-El workflow `.github/workflows/release.yml` compila Linux x86_64 y publica un
-`.tar.gz` cuando subes un tag:
+Or install with Cargo:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+cargo install --path .
 ```
 
-Tambien puedes generar el paquete localmente:
+## Usage
 
-```bash
-./scripts/package-tar.sh
-```
-
-## Crear repo en GitHub
-
-Con `gh` autenticado y permisos en la organizacion `orvixapp`:
-
-```bash
-gh auth login -h github.com
-gh repo create orvixapp/gsw \
-  --public \
-  --description "Tiny Linux process and container resource monitor for Go servers" \
-  --source=. \
-  --remote=origin \
-  --push
-```
-
-Despues publica el primer release:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-## Adjuntarse a un proceso existente
+Watch an existing process:
 
 ```bash
 gsw watch --pid 12345 --interval 2 --db server-metrics.db
 ```
 
-Tambien puede buscar por nombre:
+Find a process by name:
 
 ```bash
-gsw watch --name mi-servidor-go --interval 2
+gsw watch --name api-server --interval 2
 ```
 
-Si encuentra varios procesos, muestra los PIDs y te pide usar `--pid` para no
-medir el proceso equivocado.
-
-## Seguir un contenedor Docker
-
-Para un deploy como OrvixApp, donde el contenedor se recrea pero conserva el
-nombre `orvix-api`, usa:
+Launch a process and watch it:
 
 ```bash
-gsw watch --container orvix-api --interval 5 --retention-hours 24 --max-samples 30000 --db ./orvixapp-metrics.db
+gsw watch --db server-metrics.db -- ./server
 ```
 
-`gsw` resuelve el PID real del contenedor en el host con `docker inspect`. Si el
-deploy hace `docker stop orvix-api`, `docker rm orvix-api` y luego `docker run
---name orvix-api`, el monitor espera durante el hueco y se reengancha al nuevo
-PID cuando el contenedor vuelve a estar arriba.
-
-## Lanzar el servidor Go y medirlo
+Pass arguments to the launched process:
 
 ```bash
-gsw watch --db server-metrics.db -- ./main
+gsw watch --interval 1 -- ./server --port 8080
 ```
 
-Con argumentos:
+For production, it is usually safer to start the application normally and
+attach `gsw` by PID or container name. That way stopping `gsw` does not stop the
+application.
+
+## Docker
+
+Watch a container by stable name:
 
 ```bash
-gsw watch --interval 1 -- ./main --port 8080
+gsw watch --container api-server --interval 5 --retention-hours 24 --max-samples 30000 --db server-metrics.db
 ```
 
-Todo lo que va despues de `--` es el comando del servidor. El monitor mide solo
-ese proceso hijo, no todo el sistema.
+`gsw` resolves the container's host PID with `docker inspect`. If a deploy stops
+and recreates the container with the same name, `gsw` waits during the gap and
+attaches to the new PID when the container is running again.
 
-Para produccion es mas conservador arrancar tu servidor como siempre y adjuntar
-`gsw` por PID:
+The user running `gsw` must be allowed to run:
 
 ```bash
-pgrep -af './main|orxivapp_back/main'
-gsw watch --pid 12345 --db server-metrics.db
+docker inspect -f '{{.State.Pid}}' api-server
 ```
 
-Si tu servidor corre en Docker, prefiere `--container orvix-api` en vez de
-`--pid`, porque el PID cambia en cada recreacion del contenedor.
+## Live View
 
-## Vista en tiempo real
+The terminal view shows:
 
-La pantalla muestra:
+- Process CPU and percent of total host capacity.
+- Total system CPU usage.
+- Process RSS memory and percent of host memory.
+- System used and available memory.
+- Load average and uptime.
+- Thread count.
+- Accumulated disk read/write counters when available.
+- Session peaks.
 
-- CPU del proceso y porcentaje real de la instancia completa.
-- CPU total del sistema.
-- RAM RSS del proceso y porcentaje de la RAM total.
-- RAM usada/disponible del sistema.
-- Load average, uptime, threads y acumulados de disco.
-- Picos vistos durante la sesion.
+Exit with `Ctrl+C`.
 
-Para salir usa `Ctrl+C`.
+## Retention
 
-## Retencion
+By default, `gsw` keeps:
 
-Por defecto `gsw` conserva 72 horas y como maximo 150000 muestras. Eso evita que
-SQLite crezca sin control en instancias con disco pequeno.
+- 72 hours of samples.
+- 150000 samples maximum.
 
-Para una instancia de 6 GB u 8 GB puedes ser mas agresivo:
+For small disks, use a wider interval and stricter retention:
 
 ```bash
-gsw watch --interval 5 --retention-hours 24 --max-samples 30000 --db server-metrics.db -- ./main
+gsw watch --interval 5 --retention-hours 24 --max-samples 30000 --db server-metrics.db -- ./server
 ```
 
-Si usas `--interval 5`, 24 horas son unas 17280 muestras.
+With `--interval 5`, 24 hours is about 17280 samples.
 
-## Ver horas pico
+## Summary
 
-Despues de dejarlo corriendo unas horas:
+After collecting data:
 
 ```bash
 gsw summary --db server-metrics.db
 ```
 
-La columna `CPU proc` usa la misma idea que `top`: `100%` significa un core
-completo. Si tu servidor Go usa varios cores, puede pasar de `100%`.
+`CPU proc` follows the same convention as `top`: `100%` means one full CPU core.
+A multi-core application can go above `100%`.
 
-## Datos guardados
+## Data
 
-SQLite crea una tabla `samples` con:
+SQLite creates a `samples` table with:
 
-- `local_ts`: fecha y hora local de la muestra.
-- `local_hour`: bucket horario para agrupar horas pico.
-- `cpu_percent`: consumo del proceso, donde `100% = 1 core`.
-- `system_cpu_percent`: CPU total del sistema.
-- `rss_mb`: RAM fisica real usada por el proceso.
-- `mem_total_mb`, `mem_used_mb`, `mem_available_mb`: RAM del sistema.
-- `vm_size_mb`: memoria virtual reservada por el proceso.
-- `threads`: cantidad de threads del proceso.
-- `load1`, `load5`, `load15`: carga del sistema.
-- `read_mb` y `write_mb`: bytes de disco acumulados reportados por Linux.
+- `local_ts`: local sample timestamp.
+- `local_hour`: hourly bucket.
+- `cpu_percent`: process CPU, where `100% = one full core`.
+- `system_cpu_percent`: total system CPU.
+- `rss_mb`: process physical memory.
+- `mem_total_mb`, `mem_used_mb`, `mem_available_mb`: system memory.
+- `vm_size_mb`: process virtual memory.
+- `threads`: process thread count.
+- `load1`, `load5`, `load15`: system load averages.
+- `read_mb`, `write_mb`: accumulated disk counters when available.
 
-## Seguridad
+## Releases
 
-El programa no expone una interfaz web ni sockets. La superficie de ataque es
-la misma de ejecutar un binario local que lee `/proc` y escribe un archivo
-SQLite en disco.
+The GitHub Actions workflow builds Linux x86_64 release archives when a version
+tag is pushed:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Build the same archive locally:
+
+```bash
+./scripts/package-tar.sh
+```
+
+## Security
+
+`gsw` is a local CLI. It does not expose HTTP, listen on sockets, or accept
+remote input. It reads local Linux process information and writes a local SQLite
+database.

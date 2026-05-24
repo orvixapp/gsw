@@ -192,7 +192,7 @@ pub fn print_help() {
 Uso:
   gsw watch --pid <PID> [--interval 2] [--db server-metrics.db]
   gsw watch --name <texto> [--interval 2] [--db server-metrics.db]
-  gsw watch --container orvix-api [--interval 5] [--db server-metrics.db]
+  gsw watch --container api-server [--interval 5] [--db server-metrics.db]
   gsw watch [--interval 2] [--db server-metrics.db] -- ./main -flag valor
   gsw summary [--db server-metrics.db]
 
