@@ -17,15 +17,13 @@ pub struct LaunchedProcess {
 
 impl LaunchedProcess {
     pub fn spawn(command: &[String]) -> Result<Self, String> {
-        let program = command
-            .first()
-            .ok_or("no hay comando para lanzar el servidor")?;
+        let program = command.first().ok_or("no command was provided to launch")?;
         let mut child = Command::new(program);
         child.args(&command[1..]);
 
         let child = child
             .spawn()
-            .map_err(|err| format!("no pude lanzar {program}: {err}"))?;
+            .map_err(|err| format!("failed to launch {program}: {err}"))?;
 
         Ok(Self {
             child,
@@ -42,7 +40,7 @@ impl LaunchedProcess {
             .child
             .try_wait()
             .map(|status| status.map(|s| s.code().unwrap_or_default()))
-            .map_err(|err| format!("no pude revisar el proceso hijo: {err}"))?;
+            .map_err(|err| format!("failed to inspect launched process: {err}"))?;
 
         if status.is_some() {
             self.finished = true;
@@ -65,7 +63,7 @@ pub fn find_single_process(needle: &str) -> Result<ProcessCandidate, String> {
     let needle = needle.to_lowercase();
     let mut candidates = Vec::new();
 
-    for entry in fs::read_dir("/proc").map_err(|err| format!("no pude listar /proc: {err}"))? {
+    for entry in fs::read_dir("/proc").map_err(|err| format!("failed to list /proc: {err}"))? {
         let entry = entry.map_err(|err| err.to_string())?;
         let filename = entry.file_name();
         let Some(pid_str) = filename.to_str() else {
@@ -85,11 +83,11 @@ pub fn find_single_process(needle: &str) -> Result<ProcessCandidate, String> {
     }
 
     match candidates.len() {
-        0 => Err(format!("no encontre procesos que coincidan con '{needle}'")),
+        0 => Err(format!("no process matched '{needle}'")),
         1 => Ok(candidates.remove(0)),
         _ => {
             let mut message =
-                format!("encontre varios procesos para '{needle}'. Usa --pid con uno de estos:\n");
+                format!("multiple processes matched '{needle}'; use --pid with one of these:\n");
             for candidate in candidates.iter().take(12) {
                 message.push_str(&format!(
                     "  pid={} comm={} cmdline={}\n",
@@ -105,7 +103,7 @@ pub fn docker_container_pid(container: &str) -> Result<Option<i32>, String> {
     let output = Command::new("docker")
         .args(["inspect", "-f", "{{.State.Pid}}", container])
         .output()
-        .map_err(|err| format!("no pude ejecutar docker inspect: {err}"))?;
+        .map_err(|err| format!("failed to execute docker inspect: {err}"))?;
 
     if !output.status.success() {
         return Ok(None);
@@ -115,7 +113,7 @@ pub fn docker_container_pid(container: &str) -> Result<Option<i32>, String> {
     let value = stdout.trim();
     let pid = value
         .parse::<i32>()
-        .map_err(|_| format!("docker inspect devolvio un PID invalido: {value}"))?;
+        .map_err(|_| format!("docker inspect returned an invalid PID: {value}"))?;
 
     if pid > 0 { Ok(Some(pid)) } else { Ok(None) }
 }

@@ -27,7 +27,7 @@ pub fn epoch_seconds() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|err| format!("reloj del sistema invalido: {err}"))
+        .map_err(|err| format!("invalid system clock: {err}"))
 }
 
 pub fn local_time_strings(epoch: u64) -> (String, String) {

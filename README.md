@@ -1,28 +1,35 @@
 # gsw
 
-`gsw` is a small Linux CLI for watching the CPU, memory, disk counters, load,
-and uptime around one process or Docker container.
+`gsw` is a low-overhead Linux monitoring agent for processes, Docker containers,
+and Go services. It is designed for small servers where a full Prometheus and
+Grafana stack would consume too much memory.
 
-It is designed for small servers where a full monitoring stack is too much. It
-does not open ports, serve HTTP, or expose a web UI. Metrics are read from
-`/proc`, shown in the terminal, and stored in a local SQLite database.
+It opens no listening ports. Metrics come from `/proc`, cgroup v2, and optional
+loopback-only Go pprof endpoints. Samples are displayed in a terminal dashboard
+and stored in a local SQLite database.
 
 ## Features
 
-- Live terminal view for one process.
-- Docker container tracking by stable container name.
-- Automatic re-attach when a container is recreated.
-- SQLite history with retention limits.
-- Hourly summary for peak usage analysis.
-- No background daemon, no web server, no network listener.
+- Monitor multiple named services in one process.
+- Track services by PID, process name, or stable Docker container name.
+- Reattach automatically when a container is recreated.
+- Read aggregate container CPU, memory, I/O, and task counts from cgroup v2.
+- Track process CPU, RSS, virtual memory, threads, file descriptors, and I/O rates.
+- Store per-service history in SQLite with WAL and retention limits.
+- Sample Go goroutine counts from optional pprof endpoints.
+- Detect sustained goroutine growth using a bounded in-memory trend window.
+- Run interactively or as a headless systemd agent.
+- Keep all CLI, diagnostics, configuration, and terminal output in English.
 
 ## Requirements
 
 - Linux.
 - SQLite runtime library.
-- Docker CLI only when using `--container`.
+- Docker CLI and access to `/var/run/docker.sock` for container targets.
+- cgroup v2 for aggregate container metrics. Process metrics remain available as
+  a fallback when cgroup v2 cannot be read.
 
-Install SQLite runtime:
+Install the SQLite runtime:
 
 ```bash
 # Arch / CachyOS
@@ -32,152 +39,140 @@ sudo pacman -S sqlite
 sudo apt install libsqlite3-0
 ```
 
-## Install From Release
-
-Download the Linux archive from GitHub Releases, then:
-
-```bash
-tar -xzf gsw-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd gsw-v0.1.0-x86_64-unknown-linux-gnu
-sudo install -m 0755 gsw /usr/local/bin/gsw
-gsw --help
-```
-
-## Build From Source
+## Build
 
 ```bash
 cargo build --release
 sudo install -m 0755 target/release/gsw /usr/local/bin/gsw
 ```
 
-Or install with Cargo:
+## Interactive usage
+
+Monitor several containers:
 
 ```bash
-cargo install --path .
+gsw watch \
+  --service api=container:orvix-api \
+  --service telephony=container:orvix-telephony \
+  --service cache=container:llavero \
+  --interval 5 \
+  --db server-metrics.db
 ```
 
-## Usage
-
-Watch an existing process:
+Legacy single-target commands remain supported:
 
 ```bash
-gsw watch --pid 12345 --interval 2 --db server-metrics.db
+gsw watch --pid 12345
+gsw watch --name api-server --label api
+gsw watch --container api-server --label api
+gsw watch -- ./server --port 8080
 ```
 
-Find a process by name:
+`CPU 100%` means one full logical CPU, following `top` semantics. A multi-core
+service can exceed 100%.
+
+## Configuration
+
+Copy the example and edit service names:
 
 ```bash
-gsw watch --name api-server --interval 2
+sudo install -d -m 0755 /etc/gsw /var/lib/gsw
+sudo install -m 0644 config/gsw.example.toml /etc/gsw/config.toml
+gsw watch --config /etc/gsw/config.toml
 ```
 
-Launch a process and watch it:
+Example:
+
+```toml
+database = "/var/lib/gsw/metrics.db"
+interval_seconds = 5
+pprof_interval_seconds = 30
+retention_hours = 168
+max_samples = 150000
+
+[[services]]
+name = "api"
+target = "container:orvix-api"
+
+[[services]]
+name = "telephony"
+target = "container:orvix-telephony"
+```
+
+Supported target formats are `pid:123`, `name:server`, and
+`container:container-name`.
+
+## Headless agent
+
+The `agent` command runs the same collector without redrawing a dashboard:
 
 ```bash
-gsw watch --db server-metrics.db -- ./server
+gsw agent --config /etc/gsw/config.toml
 ```
 
-Pass arguments to the launched process:
+Install the supplied systemd unit:
 
 ```bash
-gsw watch --interval 1 -- ./server --port 8080
+sudo install -m 0644 packaging/systemd/gsw.service /etc/systemd/system/gsw.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now gsw
+sudo systemctl status gsw
 ```
 
-For production, it is usually safer to start the application normally and
-attach `gsw` by PID or container name. That way stopping `gsw` does not stop the
-application.
+The unit applies a 32 MiB memory high-water mark and a 96 MiB hard limit to keep
+the monitoring agent from becoming a resource problem itself.
 
-## Docker
+## Go runtime metrics
 
-Watch a container by stable name:
+`/proc` and cgroups cannot see goroutines. A Go service must expose pprof on a
+private endpoint. Never attach pprof to a public application port.
+
+For Docker, publish a dedicated diagnostics port on loopback only:
+
+```yaml
+ports:
+  - "127.0.0.1:6060:6060"
+```
+
+Then add the URL to the service configuration:
+
+```toml
+[[services]]
+name = "api"
+target = "container:orvix-api"
+pprof_url = "http://127.0.0.1:6060"
+```
+
+The pprof request has a 750 ms timeout and a 128 KiB response limit. It runs on
+the slower `pprof_interval_seconds` schedule rather than every process sample.
+Full heap and goroutine profiles are not continuously stored.
+
+## Historical summary
 
 ```bash
-gsw watch --container api-server --interval 5 --retention-hours 24 --max-samples 30000 --db server-metrics.db
+gsw summary --db /var/lib/gsw/metrics.db
+gsw summary --service telephony --db /var/lib/gsw/metrics.db
 ```
 
-`gsw` resolves the container's host PID with `docker inspect`. If a deploy stops
-and recreates the container with the same name, `gsw` waits during the gap and
-attaches to the new PID when the container is running again.
+Rows are grouped by service and local hour. The report includes CPU averages and
+peaks, RSS averages and peaks, goroutine trends, and peak file descriptor usage.
 
-The user running `gsw` must be allowed to run:
+## Retention and disk use
 
-```bash
-docker inspect -f '{{.State.Pid}}' api-server
-```
+The default configuration retains seven days of detailed samples and at most
+150,000 rows per service. Count-based pruning is partitioned by service, so
+adding more services does not silently shorten another service's history.
 
-## Live View
+SQLite runs in WAL mode. Do not manually delete the `-wal` or `-shm` files while
+the agent is running.
 
-The terminal view shows:
+## Architecture
 
-- Process CPU and percent of total host capacity.
-- Total system CPU usage.
-- Process RSS memory and percent of host memory.
-- System used and available memory.
-- Load average and uptime.
-- Thread count.
-- Accumulated disk read/write counters when available.
-- Session peaks.
-
-Exit with `Ctrl+C`.
-
-## Retention
-
-By default, `gsw` keeps:
-
-- 72 hours of samples.
-- 150000 samples maximum.
-
-For small disks, use a wider interval and stricter retention:
-
-```bash
-gsw watch --interval 5 --retention-hours 24 --max-samples 30000 --db server-metrics.db -- ./server
-```
-
-With `--interval 5`, 24 hours is about 17280 samples.
-
-## Summary
-
-After collecting data:
-
-```bash
-gsw summary --db server-metrics.db
-```
-
-`CPU proc` follows the same convention as `top`: `100%` means one full CPU core.
-A multi-core application can go above `100%`.
-
-## Data
-
-SQLite creates a `samples` table with:
-
-- `local_ts`: local sample timestamp.
-- `local_hour`: hourly bucket.
-- `cpu_percent`: process CPU, where `100% = one full core`.
-- `system_cpu_percent`: total system CPU.
-- `rss_mb`: process physical memory.
-- `mem_total_mb`, `mem_used_mb`, `mem_available_mb`: system memory.
-- `vm_size_mb`: process virtual memory.
-- `threads`: process thread count.
-- `load1`, `load5`, `load15`: system load averages.
-- `read_mb`, `write_mb`: accumulated disk counters when available.
-
-## Releases
-
-The GitHub Actions workflow builds Linux x86_64 release archives when a version
-tag is pushed:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Build the same archive locally:
-
-```bash
-./scripts/package-tar.sh
-```
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module boundaries,
+collection flow, and storage decisions.
 
 ## Security
 
-`gsw` is a local CLI. It does not expose HTTP, listen on sockets, or accept
-remote input. It reads local Linux process information and writes a local SQLite
-database.
+`gsw` does not serve HTTP or accept remote input. Docker socket access is highly
+privileged; only trusted users should run container monitoring. Pprof endpoints
+must remain on loopback or another private transport.
