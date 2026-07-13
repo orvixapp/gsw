@@ -1,0 +1,23 @@
+# Global collection settings. Detailed samples are retained for seven days.
+database = "/var/lib/gsw/metrics.db"
+interval_seconds = 5
+pprof_interval_seconds = 30
+retention_hours = 168
+max_samples = 150000
+
+[[services]]
+name = "api"
+target = "container:orvix-api"
+pprof_url = "http://127.0.0.1:6060"
+
+[[services]]
+name = "telephony"
+target = "container:orvix-telephony"
+pprof_url = "http://127.0.0.1:6061"
+
+[[services]]
+name = "cache"
+target = "container:llavero"
+# Enable after the Llavero container publishes its diagnostics port as
+# 127.0.0.1:6062:6062.
+# pprof_url = "http://127.0.0.1:6062"

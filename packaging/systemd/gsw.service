@@ -1,0 +1,25 @@
+[Unit]
+Description=gsw lightweight service monitoring agent
+Documentation=https://github.com/orvixapp/gsw
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gsw agent --config /etc/gsw/config.toml
+Restart=on-failure
+RestartSec=5s
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gsw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryHigh=32M
+MemoryMax=96M
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

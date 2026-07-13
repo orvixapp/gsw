@@ -1,5 +1,5 @@
-use crate::metrics::Metrics;
-use crate::summary::HourSummary;
+use crate::domain::metrics::Metrics;
+use crate::presentation::summary::HourSummary;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::Path;
@@ -8,6 +8,7 @@ use std::ptr;
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
 const SQLITE_DONE: c_int = 101;
+const SQLITE_NULL: c_int = 5;
 const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
 const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
@@ -62,6 +63,7 @@ unsafe extern "C" {
     fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, index: c_int) -> i64;
     fn sqlite3_column_double(stmt: *mut sqlite3_stmt, index: c_int) -> c_double;
     fn sqlite3_column_text(stmt: *mut sqlite3_stmt, index: c_int) -> *const c_char;
+    fn sqlite3_column_type(stmt: *mut sqlite3_stmt, index: c_int) -> c_int;
 }
 
 type SqliteDestructor = Option<unsafe extern "C" fn(*mut c_void)>;
@@ -77,14 +79,14 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
         let filename = CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|_| "la ruta SQLite contiene un byte nulo".to_string())?;
+            .map_err(|_| "SQLite path contains a null byte".to_string())?;
         let mut db = ptr::null_mut();
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
 
         let rc = unsafe { sqlite3_open_v2(filename.as_ptr(), &mut db, flags, ptr::null()) };
         if rc != SQLITE_OK {
             let message = if db.is_null() {
-                format!("no pude abrir {}", path.display())
+                format!("failed to open {}", path.display())
             } else {
                 unsafe { error_message(db) }
             };
@@ -108,6 +110,8 @@ impl Store {
             PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_name TEXT NOT NULL DEFAULT 'default',
+                pid INTEGER NOT NULL DEFAULT 0,
                 epoch INTEGER NOT NULL,
                 local_ts TEXT NOT NULL,
                 local_hour TEXT NOT NULL,
@@ -115,8 +119,13 @@ impl Store {
                 rss_mb REAL NOT NULL,
                 vm_size_mb REAL NOT NULL,
                 threads INTEGER NOT NULL,
+                file_descriptors INTEGER NOT NULL DEFAULT 0,
                 read_mb REAL,
                 write_mb REAL,
+                read_mb_per_sec REAL,
+                write_mb_per_sec REAL,
+                goroutines INTEGER,
+                goroutine_growth_per_min REAL,
                 cpu_capacity_percent REAL NOT NULL DEFAULT 0,
                 system_cpu_percent REAL NOT NULL DEFAULT 0,
                 rss_system_percent REAL NOT NULL DEFAULT 0,
@@ -132,6 +141,19 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_samples_epoch ON samples(epoch);
             ",
         )?;
+        self.add_column_if_missing(
+            "ALTER TABLE samples ADD COLUMN service_name TEXT NOT NULL DEFAULT 'default'",
+        )?;
+        self.add_column_if_missing(
+            "ALTER TABLE samples ADD COLUMN pid INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "ALTER TABLE samples ADD COLUMN file_descriptors INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing("ALTER TABLE samples ADD COLUMN read_mb_per_sec REAL")?;
+        self.add_column_if_missing("ALTER TABLE samples ADD COLUMN write_mb_per_sec REAL")?;
+        self.add_column_if_missing("ALTER TABLE samples ADD COLUMN goroutines INTEGER")?;
+        self.add_column_if_missing("ALTER TABLE samples ADD COLUMN goroutine_growth_per_min REAL")?;
         self.add_column_if_missing(
             "ALTER TABLE samples ADD COLUMN cpu_capacity_percent REAL NOT NULL DEFAULT 0",
         )?;
@@ -157,40 +179,61 @@ impl Store {
         )?;
         self.add_column_if_missing(
             "ALTER TABLE samples ADD COLUMN uptime_secs INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.exec(
+            "
+            CREATE INDEX IF NOT EXISTS idx_samples_service_epoch
+                ON samples(service_name, epoch);
+            CREATE INDEX IF NOT EXISTS idx_samples_service_hour
+                ON samples(service_name, local_hour);
+            ",
         )
     }
 
-    pub fn insert_sample(&self, metrics: &Metrics) -> Result<(), String> {
+    pub fn insert_sample(
+        &self,
+        service_name: &str,
+        pid: i32,
+        metrics: &Metrics,
+    ) -> Result<(), String> {
         let sql = "
             INSERT INTO samples (
-                epoch, local_ts, local_hour, cpu_percent, rss_mb,
-                vm_size_mb, threads, read_mb, write_mb,
+                service_name, pid, epoch, local_ts, local_hour, cpu_percent, rss_mb,
+                vm_size_mb, threads, file_descriptors, read_mb, write_mb,
+                read_mb_per_sec, write_mb_per_sec, goroutines, goroutine_growth_per_min,
                 cpu_capacity_percent, system_cpu_percent, rss_system_percent,
                 mem_total_mb, mem_used_mb, mem_available_mb,
                 load1, load5, load15, uptime_secs
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ";
         let stmt = Statement::prepare(self.db, sql)?;
-        stmt.bind_i64(1, metrics.epoch as i64)?;
-        stmt.bind_text(2, &metrics.local_ts)?;
-        stmt.bind_text(3, &metrics.local_hour)?;
-        stmt.bind_f64(4, metrics.cpu_percent)?;
-        stmt.bind_f64(5, metrics.rss_mb)?;
-        stmt.bind_f64(6, metrics.vm_size_mb)?;
-        stmt.bind_i64(7, metrics.threads as i64)?;
-        stmt.bind_optional_f64(8, metrics.read_mb)?;
-        stmt.bind_optional_f64(9, metrics.write_mb)?;
-        stmt.bind_f64(10, metrics.cpu_capacity_percent)?;
-        stmt.bind_f64(11, metrics.system_cpu_percent)?;
-        stmt.bind_f64(12, metrics.rss_system_percent)?;
-        stmt.bind_f64(13, metrics.mem_total_mb)?;
-        stmt.bind_f64(14, metrics.mem_used_mb)?;
-        stmt.bind_f64(15, metrics.mem_available_mb)?;
-        stmt.bind_f64(16, metrics.load1)?;
-        stmt.bind_f64(17, metrics.load5)?;
-        stmt.bind_f64(18, metrics.load15)?;
-        stmt.bind_i64(19, metrics.uptime_secs as i64)?;
+        stmt.bind_text(1, service_name)?;
+        stmt.bind_i64(2, pid as i64)?;
+        stmt.bind_i64(3, metrics.epoch as i64)?;
+        stmt.bind_text(4, &metrics.local_ts)?;
+        stmt.bind_text(5, &metrics.local_hour)?;
+        stmt.bind_f64(6, metrics.cpu_percent)?;
+        stmt.bind_f64(7, metrics.rss_mb)?;
+        stmt.bind_f64(8, metrics.vm_size_mb)?;
+        stmt.bind_i64(9, metrics.threads as i64)?;
+        stmt.bind_i64(10, metrics.file_descriptors as i64)?;
+        stmt.bind_optional_f64(11, metrics.read_mb)?;
+        stmt.bind_optional_f64(12, metrics.write_mb)?;
+        stmt.bind_optional_f64(13, metrics.read_mb_per_sec)?;
+        stmt.bind_optional_f64(14, metrics.write_mb_per_sec)?;
+        stmt.bind_optional_i64(15, metrics.goroutines.map(|value| value as i64))?;
+        stmt.bind_optional_f64(16, metrics.goroutine_growth_per_min)?;
+        stmt.bind_f64(17, metrics.cpu_capacity_percent)?;
+        stmt.bind_f64(18, metrics.system_cpu_percent)?;
+        stmt.bind_f64(19, metrics.rss_system_percent)?;
+        stmt.bind_f64(20, metrics.mem_total_mb)?;
+        stmt.bind_f64(21, metrics.mem_used_mb)?;
+        stmt.bind_f64(22, metrics.mem_available_mb)?;
+        stmt.bind_f64(23, metrics.load1)?;
+        stmt.bind_f64(24, metrics.load5)?;
+        stmt.bind_f64(25, metrics.load15)?;
+        stmt.bind_i64(26, metrics.uptime_secs as i64)?;
         stmt.step_done()
     }
 
@@ -213,10 +256,16 @@ impl Store {
                 "
                 DELETE FROM samples
                 WHERE id IN (
-                    SELECT id
-                    FROM samples
-                    ORDER BY id DESC
-                    LIMIT -1 OFFSET ?
+                    SELECT id FROM (
+                        SELECT
+                            id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY service_name
+                                ORDER BY id DESC
+                            ) AS service_row
+                        FROM samples
+                    )
+                    WHERE service_row > ?
                 )
                 ",
             )?;
@@ -227,45 +276,73 @@ impl Store {
         Ok(())
     }
 
-    pub fn hourly_summary(&self) -> Result<Vec<HourSummary>, String> {
-        let sql = "
+    pub fn hourly_summary(&self, service: Option<&str>) -> Result<Vec<HourSummary>, String> {
+        let sql_all = "
             SELECT
+                service_name,
                 local_hour,
                 COUNT(*) AS samples,
                 AVG(cpu_percent) AS cpu_avg,
                 MAX(cpu_percent) AS cpu_peak,
-                AVG(system_cpu_percent) AS system_cpu_avg,
-                MAX(system_cpu_percent) AS system_cpu_peak,
+                AVG(rss_mb) AS rss_avg,
                 MAX(rss_mb) AS rss_peak,
-                MAX(mem_used_mb) AS system_mem_peak
+                AVG(goroutines) AS goroutines_avg,
+                MAX(goroutines) AS goroutines_peak,
+                MAX(file_descriptors) AS file_descriptors_peak
             FROM samples
-            GROUP BY local_hour
+            GROUP BY service_name, local_hour
+            ORDER BY local_hour, service_name
+        ";
+        let sql_service = "
+            SELECT
+                service_name,
+                local_hour,
+                COUNT(*) AS samples,
+                AVG(cpu_percent) AS cpu_avg,
+                MAX(cpu_percent) AS cpu_peak,
+                AVG(rss_mb) AS rss_avg,
+                MAX(rss_mb) AS rss_peak,
+                AVG(goroutines) AS goroutines_avg,
+                MAX(goroutines) AS goroutines_peak,
+                MAX(file_descriptors) AS file_descriptors_peak
+            FROM samples
+            WHERE service_name = ?
+            GROUP BY service_name, local_hour
             ORDER BY local_hour
         ";
-        let stmt = Statement::prepare(self.db, sql)?;
+        let stmt = Statement::prepare(
+            self.db,
+            if service.is_some() {
+                sql_service
+            } else {
+                sql_all
+            },
+        )?;
+        if let Some(service) = service {
+            stmt.bind_text(1, service)?;
+        }
         let mut rows = Vec::new();
 
-        loop {
-            match stmt.step()? {
-                Step::Row => rows.push(HourSummary {
-                    local_hour: stmt.column_text(0),
-                    samples: stmt.column_i64(1),
-                    cpu_avg: stmt.column_f64(2),
-                    cpu_peak: stmt.column_f64(3),
-                    system_cpu_avg: stmt.column_f64(4),
-                    system_cpu_peak: stmt.column_f64(5),
-                    rss_peak: stmt.column_f64(6),
-                    system_mem_peak: stmt.column_f64(7),
-                }),
-                Step::Done => break,
-            }
+        while let Step::Row = stmt.step()? {
+            rows.push(HourSummary {
+                service_name: stmt.column_text(0),
+                local_hour: stmt.column_text(1),
+                samples: stmt.column_i64(2),
+                cpu_avg: stmt.column_f64(3),
+                cpu_peak: stmt.column_f64(4),
+                rss_avg: stmt.column_f64(5),
+                rss_peak: stmt.column_f64(6),
+                goroutines_avg: stmt.column_optional_f64(7),
+                goroutines_peak: stmt.column_optional_i64(8),
+                file_descriptors_peak: stmt.column_i64(9),
+            });
         }
 
         Ok(rows)
     }
 
     fn exec(&self, sql: &str) -> Result<(), String> {
-        let sql = CString::new(sql).map_err(|_| "SQL contiene un byte nulo".to_string())?;
+        let sql = CString::new(sql).map_err(|_| "SQL contains a null byte".to_string())?;
         let mut errmsg = ptr::null_mut();
         let rc = unsafe { sqlite3_exec(self.db, sql.as_ptr(), None, ptr::null_mut(), &mut errmsg) };
 
@@ -316,7 +393,7 @@ struct Statement {
 
 impl Statement {
     fn prepare(db: *mut sqlite3, sql: &str) -> Result<Self, String> {
-        let sql = CString::new(sql).map_err(|_| "SQL contiene un byte nulo".to_string())?;
+        let sql = CString::new(sql).map_err(|_| "SQL contains a null byte".to_string())?;
         let mut stmt = ptr::null_mut();
         let rc = unsafe { sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
         if rc != SQLITE_OK {
@@ -340,8 +417,15 @@ impl Statement {
         }
     }
 
+    fn bind_optional_i64(&self, index: c_int, value: Option<i64>) -> Result<(), String> {
+        match value {
+            Some(value) => self.bind_i64(index, value),
+            None => self.check(unsafe { sqlite3_bind_null(self.stmt, index) }),
+        }
+    }
+
     fn bind_text(&self, index: c_int, value: &str) -> Result<(), String> {
-        let value = CString::new(value).map_err(|_| "texto contiene un byte nulo".to_string())?;
+        let value = CString::new(value).map_err(|_| "text contains a null byte".to_string())?;
         self.check(unsafe {
             sqlite3_bind_text(self.stmt, index, value.as_ptr(), -1, sqlite_transient())
         })
@@ -358,7 +442,7 @@ impl Statement {
     fn step_done(&self) -> Result<(), String> {
         match self.step()? {
             Step::Done => Ok(()),
-            Step::Row => Err("SQLite devolvio una fila donde esperaba fin".to_string()),
+            Step::Row => Err("SQLite returned a row where completion was expected".to_string()),
         }
     }
 
@@ -368,6 +452,16 @@ impl Statement {
 
     fn column_f64(&self, index: c_int) -> f64 {
         unsafe { sqlite3_column_double(self.stmt, index) }
+    }
+
+    fn column_optional_i64(&self, index: c_int) -> Option<i64> {
+        (unsafe { sqlite3_column_type(self.stmt, index) } != SQLITE_NULL)
+            .then(|| self.column_i64(index))
+    }
+
+    fn column_optional_f64(&self, index: c_int) -> Option<f64> {
+        (unsafe { sqlite3_column_type(self.stmt, index) } != SQLITE_NULL)
+            .then(|| self.column_f64(index))
     }
 
     fn column_text(&self, index: c_int) -> String {
@@ -403,10 +497,92 @@ impl Drop for Statement {
 unsafe fn error_message(db: *mut sqlite3) -> String {
     let ptr = unsafe { sqlite3_errmsg(db) };
     if ptr.is_null() {
-        "error SQLite desconocido".to_string()
+        "unknown SQLite error".to_string()
     } else {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn stores_and_prunes_samples_per_service() {
+        let path = test_database_path();
+        {
+            let store = Store::open(&path).unwrap();
+            for epoch in 1..=3 {
+                store.insert_sample("api", 10, &metrics(epoch)).unwrap();
+                store.insert_sample("worker", 20, &metrics(epoch)).unwrap();
+            }
+            store.prune(0, 2, 3).unwrap();
+            let rows = store.hourly_summary(None).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.samples == 2));
+            assert!(rows.iter().any(|row| row.service_name == "api"));
+            assert!(rows.iter().any(|row| row.service_name == "worker"));
+        }
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn filters_summary_by_service() {
+        let path = test_database_path();
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_sample("api", 10, &metrics(1)).unwrap();
+            store.insert_sample("worker", 20, &metrics(1)).unwrap();
+            let rows = store.hourly_summary(Some("api")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].service_name, "api");
+        }
+        remove_database_files(&path);
+    }
+
+    fn metrics(epoch: u64) -> Metrics {
+        Metrics {
+            epoch,
+            local_ts: "2026-01-01 00:00:00".into(),
+            local_hour: "2026-01-01 00:00".into(),
+            cpu_percent: 10.0,
+            cpu_capacity_percent: 5.0,
+            system_cpu_percent: 20.0,
+            rss_mb: 32.0,
+            rss_system_percent: 3.2,
+            vm_size_mb: 64.0,
+            threads: 5,
+            file_descriptors: 12,
+            read_mb: Some(1.0),
+            write_mb: Some(2.0),
+            read_mb_per_sec: Some(0.1),
+            write_mb_per_sec: Some(0.2),
+            goroutines: Some(20),
+            goroutine_growth_per_min: Some(0.0),
+            mem_total_mb: 1024.0,
+            mem_used_mb: 512.0,
+            mem_available_mb: 512.0,
+            load1: 0.1,
+            load5: 0.2,
+            load15: 0.3,
+            uptime_secs: epoch,
+        }
+    }
+
+    fn test_database_path() -> std::path::PathBuf {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("gsw-test-{}-{id}.db", std::process::id()))
+    }
+
+    fn remove_database_files(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 }
